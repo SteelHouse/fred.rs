@@ -496,6 +496,7 @@ async fn read_or_write(
 #[cfg(feature = "glommio")]
 async fn drain_command_rx(inner: &RefCount<ClientInner>, rx: &mut CommandReceiver) {
   while let Some(command) = rx.try_recv().await {
+    inner.counters.decr_cmd_buffer_len();
     _warn!(inner, "Skip command with canceled error after calling quit.");
     command.cancel();
   }
@@ -504,6 +505,7 @@ async fn drain_command_rx(inner: &RefCount<ClientInner>, rx: &mut CommandReceive
 #[cfg(not(feature = "glommio"))]
 fn drain_command_rx(inner: &RefCount<ClientInner>, rx: &mut CommandReceiver) {
   while let Ok(command) = rx.try_recv() {
+    inner.counters.decr_cmd_buffer_len();
     _warn!(inner, "Skip command with canceled error after calling quit.");
     command.cancel();
   }
@@ -773,5 +775,31 @@ mod mocking {
 
     inner.store_command_rx(rx, false);
     result
+  }
+}
+
+#[cfg(test)]
+#[cfg(not(feature = "glommio"))]
+mod tests {
+  use super::*;
+  use crate::{
+    clients::Client,
+    interfaces::{self, ClientLike},
+    types::config::Config,
+  };
+
+  #[test]
+  fn should_not_count_commands_dropped_by_drain() {
+    let client = Client::new(Config::default(), None, None, None);
+    let inner = client.inner();
+    let mut rx = inner.take_command_rx().expect("Failed to take command receiver");
+    for _ in 0 .. 2 {
+      interfaces::send_to_router(inner, Command::new(CommandKind::Ping, vec![]).into())
+        .expect("Failed to send command");
+    }
+    assert_eq!(inner.counters.read_cmd_buffer_len(), 2);
+
+    drain_command_rx(inner, &mut rx);
+    assert_eq!(inner.counters.read_cmd_buffer_len(), 0);
   }
 }
