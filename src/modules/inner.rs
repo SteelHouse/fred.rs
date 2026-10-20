@@ -797,21 +797,25 @@ impl ClientInner {
 
       match v {
         TrySendError::Closed(c) => Err(c),
+        // `send_to_router` counted the command as queued, so answering it here must release that count
         TrySendError::Full(c) => match c {
           RouterCommand::Command(mut cmd) => {
             trace::backpressure_event(&cmd, None);
             cmd.respond_to_caller(Err(Error::new_backpressure()));
+            self.counters.decr_cmd_buffer_len();
             Ok(())
           },
           RouterCommand::Pipeline { mut commands, .. } => {
             if let Some(mut cmd) = commands.pop() {
               cmd.respond_to_caller(Err(Error::new_backpressure()));
             }
+            self.counters.decr_cmd_buffer_len();
             Ok(())
           },
           #[cfg(feature = "transactions")]
           RouterCommand::Transaction { tx, .. } => {
             let _ = tx.send(Err(Error::new_backpressure()));
+            self.counters.decr_cmd_buffer_len();
             Ok(())
           },
           _ => Err(c),
@@ -829,21 +833,25 @@ impl ClientInner {
     if let Err(e) = self.command_tx.load().try_send(command) {
       match e {
         GlommioError::Closed(ResourceType::Channel(v)) => Err(v),
+        // `send_to_router` counted the command as queued, so answering it here must release that count
         GlommioError::WouldBlock(ResourceType::Channel(v)) => match v {
           RouterCommand::Command(mut cmd) => {
             trace::backpressure_event(&cmd, None);
             cmd.respond_to_caller(Err(Error::new_backpressure()));
+            self.counters.decr_cmd_buffer_len();
             Ok(())
           },
           RouterCommand::Pipeline { mut commands, .. } => {
             if let Some(mut cmd) = commands.pop() {
               cmd.respond_to_caller(Err(Error::new_backpressure()));
             }
+            self.counters.decr_cmd_buffer_len();
             Ok(())
           },
           #[cfg(feature = "transactions")]
           RouterCommand::Transaction { tx, .. } => {
             let _ = tx.send(Err(Error::new_backpressure()));
+            self.counters.decr_cmd_buffer_len();
             Ok(())
           },
           _ => Err(v),

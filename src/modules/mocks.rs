@@ -360,12 +360,17 @@ mod tests {
   use super::*;
   use crate::{
     clients::Client,
-    error::Error,
-    interfaces::{ClientLike, KeysInterface},
+    error::{Error, ErrorKind},
+    interfaces::{ClientLike, KeysInterface, MetricsInterface},
     mocks::{Buffer, Echo, Mocks, SimpleMap},
     prelude::Expiration,
     runtime::JoinHandle,
-    types::{config::Config, scan::Scanner, SetOptions, Value},
+    types::{
+      config::{Config, ConnectionConfig},
+      scan::Scanner,
+      SetOptions,
+      Value,
+    },
   };
   use std::sync::Arc;
   use tokio_stream::StreamExt;
@@ -508,5 +513,33 @@ mod tests {
     keys.sort();
 
     assert_eq!(keys, vec!["foo1".to_string(), "foo2".to_string()]);
+  }
+
+  #[tokio::test]
+  async fn should_not_count_commands_rejected_with_backpressure() {
+    let config = Config {
+      mocks: Some(Arc::new(Echo)),
+      ..Default::default()
+    };
+    let connection = ConnectionConfig {
+      max_command_buffer_len: 1,
+      ..Default::default()
+    };
+    let client = Client::new(config, None, Some(connection), None);
+    let _ = client.connect();
+    client.wait_for_connect().await.expect("Failed to connect");
+
+    // the routing task cannot run until this task yields, so only one of these fits in the queue
+    let (foo, bar, baz) = tokio::join!(
+      client.get::<Value, _>("foo"),
+      client.get::<Value, _>("bar"),
+      client.get::<Value, _>("baz")
+    );
+    let rejected = [foo, bar, baz]
+      .into_iter()
+      .filter(|result| matches!(result, Err(e) if *e.kind() == ErrorKind::Backpressure))
+      .count();
+    assert_eq!(rejected, 2);
+    assert_eq!(client.command_queue_len(), 0);
   }
 }
