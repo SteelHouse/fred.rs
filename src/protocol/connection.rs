@@ -267,6 +267,8 @@ pub struct ExclusiveConnection {
   pub id:           Option<i64>,
   /// The server version.
   pub version:      Option<Version>,
+  /// The availability zone the server reports in `INFO server`.
+  pub zone:         Option<Str>,
   /// Counters for the connection state.
   pub counters:     Counters,
 }
@@ -292,6 +294,7 @@ impl ExclusiveConnection {
       counters,
       id,
       version,
+      zone: None,
       transport,
     })
   }
@@ -314,6 +317,7 @@ impl ExclusiveConnection {
       counters,
       id,
       version,
+      zone: None,
       transport,
     })
   }
@@ -353,6 +357,7 @@ impl ExclusiveConnection {
       counters,
       id,
       version,
+      zone: None,
       transport,
     })
   }
@@ -400,6 +405,7 @@ impl ExclusiveConnection {
       default_host,
       id,
       version,
+      zone: None,
       transport,
     })
   }
@@ -473,7 +479,9 @@ impl ExclusiveConnection {
       }
     });
 
-    _debug!(inner, "Read server version {:?}", self.version);
+    self.zone = protocol_utils::parse_info_field(&result, "availability_zone").map(Str::from);
+
+    _debug!(inner, "Read server version {:?}, zone {:?}", self.version, self.zone);
     Ok(())
   }
 
@@ -706,7 +714,7 @@ impl ExclusiveConnection {
   pub fn into_pipelined(self, _replica: bool) -> Connection {
     let buffer = VecDeque::with_capacity(INITIAL_BUFFER_SIZE);
     let (server, addr, default_host) = (self.server, self.addr, self.default_host);
-    let (id, version, counters) = (self.id, self.version, self.counters);
+    let (id, version, zone, counters) = (self.id, self.version, self.zone, self.counters);
 
     Connection {
       server,
@@ -714,6 +722,7 @@ impl ExclusiveConnection {
       addr,
       buffer,
       version,
+      zone,
       counters,
       id,
       last_write: None,
@@ -737,6 +746,7 @@ pub struct Connection {
   pub addr:         Option<SocketAddr>,
   pub buffer:       VecDeque<Command>,
   pub version:      Option<Version>,
+  pub zone:         Option<Str>,
   pub id:           Option<i64>,
   pub counters:     Counters,
   pub last_write:   Option<Instant>,
@@ -752,6 +762,7 @@ impl fmt::Debug for Connection {
       .field("id", &self.id)
       .field("default_host", &self.default_host)
       .field("version", &self.version)
+      .field("zone", &self.zone)
       .finish()
   }
 }

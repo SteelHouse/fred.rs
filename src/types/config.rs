@@ -27,7 +27,7 @@ use crate::mocks::Mocks;
 pub use crate::protocol::tls::{HostMapping, TlsConfig, TlsConnector, TlsHostMapping};
 #[cfg(feature = "replicas")]
 #[cfg_attr(docsrs, doc(cfg(feature = "replicas")))]
-pub use crate::router::replicas::{ReplicaConfig, ReplicaFilter};
+pub use crate::router::replicas::{ReadFrom, ReplicaConfig, ReplicaFilter};
 #[cfg(all(feature = "dns", feature = "dynamic-pool"))]
 use crate::types::Resolve;
 #[cfg(feature = "dynamic-pool")]

@@ -937,6 +937,15 @@ pub fn encode_frame(inner: &RefCount<ClientInner>, command: &Command) -> Result<
   command.to_frame(inner.is_resp3())
 }
 
+/// Read the value of `field` from an `INFO` response, ignoring empty values.
+pub fn parse_info_field<'a>(info: &'a str, field: &str) -> Option<&'a str> {
+  info
+    .lines()
+    .find_map(|line| line.split_once(':').filter(|(key, _)| *key == field))
+    .map(|(_, value)| value.trim())
+    .filter(|value| !value.is_empty())
+}
+
 #[cfg(test)]
 mod tests {
   #![allow(dead_code)]
@@ -945,6 +954,22 @@ mod tests {
   #[cfg(feature = "i-cluster")]
   use crate::types::cluster::{ClusterInfo, ClusterState};
   use std::{collections::HashMap, time::Duration};
+
+  #[test]
+  fn should_parse_info_field() {
+    let info = "# Server\r\nredis_version:7.2.4\r\nvalkey_version:8.1.10\r\navailability_zone:us-east4-a\r\n";
+
+    assert_eq!(parse_info_field(info, "availability_zone"), Some("us-east4-a"));
+    assert_eq!(parse_info_field(info, "redis_version"), Some("7.2.4"));
+    assert_eq!(parse_info_field(info, "availability"), None);
+    assert_eq!(parse_info_field(info, "missing"), None);
+  }
+
+  #[test]
+  fn should_ignore_empty_info_field() {
+    assert_eq!(parse_info_field("availability_zone:\r\n", "availability_zone"), None);
+    assert_eq!(parse_info_field("", "availability_zone"), None);
+  }
 
   fn str_to_f(s: &str) -> Resp3Frame {
     Resp3Frame::SimpleString {
