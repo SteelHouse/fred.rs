@@ -90,13 +90,33 @@ impl Router {
     }
   }
 
-  /// Find the primary node that owns the hash slot used by the command.
+  /// Find the primary node whose replicas can serve the command: the owner of its hash slot in a cluster.
+  ///
+  /// A centralized or sentinel client only reads from its primary's replicas with a zone-aware
+  /// [ReadFrom](crate::types::config::ReadFrom), which connects to them eagerly. Otherwise it keeps sending replica
+  /// commands to the primary.
   #[cfg(feature = "replicas")]
   pub fn cluster_owner(&self, command: &Command) -> Option<&Server> {
     match self.connections {
       Connections::Clustered { ref cache, .. } => command.cluster_hash().and_then(|slot| cache.get_server(slot)),
-      _ => None,
+      Connections::Centralized { ref connection } | Connections::Sentinel { ref connection } => {
+        if self.replicas.read_from.zone().is_some() {
+          connection.as_ref().map(|conn| &conn.server)
+        } else {
+          None
+        }
+      },
     }
+  }
+
+  /// The zone reported by the connection to `primary`.
+  #[cfg(feature = "replicas")]
+  fn primary_zone(&self, primary: &Server) -> Option<&Str> {
+    match self.connections {
+      Connections::Clustered { ref connections, .. } => connections.get(primary),
+      Connections::Centralized { ref connection } | Connections::Sentinel { ref connection } => connection.as_ref(),
+    }
+    .and_then(|conn| conn.zone.as_ref())
   }
 
   /// Whether a command sent to replicas should go to the primary instead, because no replica of the shard has a
@@ -111,22 +131,12 @@ impl Router {
     if command.cluster_node.is_some() {
       return false;
     }
-    let (connections, cache) = match self.connections {
-      Connections::Clustered {
-        ref connections,
-        ref cache,
-      } => (connections, cache),
-      _ => return false,
-    };
-    let primary = match command.cluster_hash().and_then(|slot| cache.get_server(slot)) {
+    let primary = match self.cluster_owner(command) {
       Some(primary) => primary,
       None => return false,
     };
 
-    !self.replicas.has_connection_in_zone(primary, zone)
-      && connections
-        .get(primary)
-        .is_some_and(|conn| conn.zone.as_ref() == Some(zone))
+    !self.replicas.has_connection_in_zone(primary, zone) && self.primary_zone(primary) == Some(zone)
   }
 
   /// Whether a deferred reconnection command exists for the provided server.
@@ -420,7 +430,10 @@ impl Router {
         .chain(connections.values())
         .filter(|conn| conn.zone.as_ref() == Some(zone))
         .count(),
-      _ => replicas.filter(|conn| conn.zone.as_ref() == Some(zone)).count(),
+      Connections::Centralized { ref connection } | Connections::Sentinel { ref connection } => replicas
+        .chain(connection.iter())
+        .filter(|conn| conn.zone.as_ref() == Some(zone))
+        .count(),
     };
 
     if in_zone == 0 {

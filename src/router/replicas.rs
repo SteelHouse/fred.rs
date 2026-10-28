@@ -76,6 +76,12 @@ pub struct ReplicaConfig {
   ///
   /// Default: [ReadFrom::AnyReplica]
   pub read_from:                  ReadFrom,
+  /// Whether every command goes through replica routing, as if sent through
+  /// [replicas](crate::clients::Client::replicas), including scans. For clients that only read, since a write sent
+  /// to a replica fails.
+  ///
+  /// Default: `false`
+  pub replicas_by_default:        bool,
   /// An optional interface for filtering available replica nodes.
   ///
   /// Default: `None`
@@ -97,6 +103,7 @@ impl fmt::Debug for ReplicaConfig {
     f.debug_struct("ReplicaConfig")
       .field("lazy_connections", &self.lazy_connections)
       .field("read_from", &self.read_from)
+      .field("replicas_by_default", &self.replicas_by_default)
       .field("ignore_reconnection_errors", &self.ignore_reconnection_errors)
       .field("primary_fallback", &self.primary_fallback)
       .finish()
@@ -107,6 +114,7 @@ impl PartialEq for ReplicaConfig {
   fn eq(&self, other: &Self) -> bool {
     self.lazy_connections == other.lazy_connections
       && self.read_from == other.read_from
+      && self.replicas_by_default == other.replicas_by_default
       && self.ignore_reconnection_errors == other.ignore_reconnection_errors
       && self.primary_fallback == other.primary_fallback
   }
@@ -119,6 +127,7 @@ impl Default for ReplicaConfig {
     ReplicaConfig {
       lazy_connections:           true,
       read_from:                  ReadFrom::AnyReplica,
+      replicas_by_default:        false,
       filter:                     None,
       ignore_reconnection_errors: true,
       primary_fallback:           true,
