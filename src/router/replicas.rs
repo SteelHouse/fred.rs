@@ -5,6 +5,7 @@ use crate::{
   runtime::RefCount,
   types::config::Server,
 };
+use bytes_utils::Str;
 use futures::future::join_all;
 use std::{
   collections::{HashMap, VecDeque},
@@ -26,6 +27,35 @@ pub trait ReplicaFilter: Send + Sync + 'static {
   }
 }
 
+/// How the client chooses the node that serves a command sent to replicas.
+///
+/// The zone-aware variants compare the client's zone with the `availability_zone` each node reports in `INFO server`
+/// (Valkey 8.0+). Nodes that do not report a zone never match.
+#[cfg_attr(docsrs, doc(cfg(feature = "replicas")))]
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub enum ReadFrom {
+  /// Round-robin across the replicas of the shard.
+  #[default]
+  AnyReplica,
+  /// Round-robin across the replicas in the provided zone, falling back to any connected replica.
+  AzAffinity(Str),
+  /// Round-robin across the replicas in the provided zone, then use the primary if it is in that zone, falling back
+  /// to any connected replica.
+  ///
+  /// With one node of each shard in each zone, this serves every read from the client's zone.
+  AzAffinityReplicasAndPrimary(Str),
+}
+
+impl ReadFrom {
+  /// The zone the client prefers, if any.
+  pub fn zone(&self) -> Option<&Str> {
+    match self {
+      ReadFrom::AnyReplica => None,
+      ReadFrom::AzAffinity(zone) | ReadFrom::AzAffinityReplicasAndPrimary(zone) => Some(zone),
+    }
+  }
+}
+
 /// Configuration options for replica node connections.
 ///
 /// When connecting to a replica the client will use the parameters specified in the
@@ -37,8 +67,21 @@ pub trait ReplicaFilter: Send + Sync + 'static {
 pub struct ReplicaConfig {
   /// Whether the client should lazily connect to replica nodes.
   ///
+  /// Ignored by the zone-aware [ReadFrom] variants, which connect eagerly since a replica's zone is only known once
+  /// the client has connected to it.
+  ///
   /// Default: `true`
   pub lazy_connections:           bool,
+  /// How the client chooses among the nodes of a shard.
+  ///
+  /// Default: [ReadFrom::AnyReplica]
+  pub read_from:                  ReadFrom,
+  /// Whether every command goes through replica routing, as if sent through
+  /// [replicas](crate::clients::Client::replicas), including scans. For clients that only read, since a write sent
+  /// to a replica fails.
+  ///
+  /// Default: `false`
+  pub replicas_by_default:        bool,
   /// An optional interface for filtering available replica nodes.
   ///
   /// Default: `None`
@@ -59,6 +102,8 @@ impl fmt::Debug for ReplicaConfig {
   fn fmt(&self, f: &mut Formatter<'_>) -> fmt::Result {
     f.debug_struct("ReplicaConfig")
       .field("lazy_connections", &self.lazy_connections)
+      .field("read_from", &self.read_from)
+      .field("replicas_by_default", &self.replicas_by_default)
       .field("ignore_reconnection_errors", &self.ignore_reconnection_errors)
       .field("primary_fallback", &self.primary_fallback)
       .finish()
@@ -68,6 +113,8 @@ impl fmt::Debug for ReplicaConfig {
 impl PartialEq for ReplicaConfig {
   fn eq(&self, other: &Self) -> bool {
     self.lazy_connections == other.lazy_connections
+      && self.read_from == other.read_from
+      && self.replicas_by_default == other.replicas_by_default
       && self.ignore_reconnection_errors == other.ignore_reconnection_errors
       && self.primary_fallback == other.primary_fallback
   }
@@ -79,10 +126,19 @@ impl Default for ReplicaConfig {
   fn default() -> Self {
     ReplicaConfig {
       lazy_connections:           true,
+      read_from:                  ReadFrom::AnyReplica,
+      replicas_by_default:        false,
       filter:                     None,
       ignore_reconnection_errors: true,
       primary_fallback:           true,
     }
+  }
+}
+
+impl ReplicaConfig {
+  /// Whether replica connections are created on first use.
+  pub(crate) fn lazy(&self) -> bool {
+    self.lazy_connections && self.read_from.zone().is_none()
   }
 }
 
@@ -100,6 +156,36 @@ impl ReplicaRouter {
   pub fn next(&mut self) -> Option<&Server> {
     self.counter = (self.counter + 1) % self.servers.len();
     self.servers.get(self.counter)
+  }
+
+  /// Read the server that should receive the next command from a client in `zone`: a connected replica in `zone`,
+  /// otherwise any connected replica, otherwise the next replica in round-robin order.
+  ///
+  /// `connected_zone` returns `None` for a replica without a connection, otherwise the zone its connection reported.
+  pub fn next_in_zone<'a>(
+    &mut self,
+    zone: &Str,
+    connected_zone: impl Fn(&Server) -> Option<Option<&'a Str>>,
+  ) -> Option<&Server> {
+    let idx = self
+      .find_next(|server| connected_zone(server) == Some(Some(zone)))
+      .or_else(|| self.find_next(|server| connected_zone(server).is_some()));
+
+    match idx {
+      Some(idx) => {
+        self.counter = idx;
+        self.servers.get(idx)
+      },
+      None => self.next(),
+    }
+  }
+
+  /// The index of the next server after the counter, in round-robin order, that matches `predicate`.
+  fn find_next(&self, predicate: impl Fn(&Server) -> bool) -> Option<usize> {
+    let len = self.servers.len();
+    (1 ..= len)
+      .map(|offset| (self.counter + offset) % len)
+      .find(|&idx| predicate(&self.servers[idx]))
   }
 
   /// Conditionally add the server to the replica set.
@@ -216,17 +302,48 @@ pub struct Replicas {
   pub connections: HashMap<Server, Connection>,
   pub routing:     ReplicaSet,
   pub buffer:      VecDeque<Command>,
+  pub read_from:   ReadFrom,
 }
 
 #[cfg(feature = "replicas")]
 #[allow(dead_code)]
 impl Replicas {
-  pub fn new() -> Replicas {
+  pub fn new(read_from: ReadFrom) -> Replicas {
     Replicas {
       connections: HashMap::new(),
-      routing:     ReplicaSet::new(),
-      buffer:      VecDeque::new(),
+      routing: ReplicaSet::new(),
+      buffer: VecDeque::new(),
+      read_from,
     }
+  }
+
+  /// Find the replica connection that should serve the next command for the shard owned by `primary`.
+  pub fn route(&mut self, primary: &Server) -> Option<&mut Connection> {
+    let Replicas {
+      connections,
+      routing,
+      read_from,
+      ..
+    } = self;
+
+    let replica = match read_from.zone() {
+      Some(zone) => routing
+        .servers
+        .get_mut(primary)?
+        .next_in_zone(zone, |replica| connections.get(replica).map(|conn| conn.zone.as_ref())),
+      None => routing.next_replica(primary),
+    }?;
+    connections.get_mut(replica)
+  }
+
+  /// Whether a replica of `primary` has a connection in `zone`.
+  pub fn has_connection_in_zone(&self, primary: &Server, zone: &Str) -> bool {
+    self.routing.replicas(primary).any(|replica| {
+      self
+        .connections
+        .get(replica)
+        .is_some_and(|conn| conn.zone.as_ref() == Some(zone))
+    })
   }
 
   /// Sync the connection map in place based on the cached routing table.
@@ -269,7 +386,10 @@ impl Replicas {
       primary
     );
 
-    if !inner.connection.replica.lazy_connections || force {
+    // A sync re-adds every replica. Opening a second connection to a connected replica would drop the first one
+    // along with its in-flight commands.
+    let connected = self.connections.contains_key(&replica);
+    if !connected && (!inner.connection.replica.lazy() || force) {
       let mut transport = connection::create(inner, &replica, None).await?;
       transport.setup(inner, None).await?;
 
@@ -422,3 +542,107 @@ pub fn map_replica_tls_names(inner: &RefCount<ClientInner>, primary: &Server, re
 
 #[cfg(not(any(feature = "enable-native-tls", feature = "enable-rustls")))]
 pub fn map_replica_tls_names(_: &RefCount<ClientInner>, _: &Server, _: &mut Server) {}
+
+#[cfg(test)]
+mod tests {
+  use super::*;
+
+  fn server(port: u16) -> Server {
+    Server::new("127.0.0.1", port)
+  }
+
+  fn router(ports: &[u16]) -> ReplicaRouter {
+    let mut router = ReplicaRouter::default();
+    for port in ports {
+      router.add(server(*port));
+    }
+    router
+  }
+
+  /// The zone of each connected replica, keyed by port.
+  fn zones(zones: &[(u16, Option<&'static str>)]) -> HashMap<u16, Option<Str>> {
+    zones
+      .iter()
+      .map(|(port, zone)| (*port, zone.map(Str::from_static)))
+      .collect()
+  }
+
+  fn next_in_zone(router: &mut ReplicaRouter, zone: &str, connected: &HashMap<u16, Option<Str>>) -> Option<u16> {
+    router
+      .next_in_zone(&Str::from(zone), |replica| {
+        connected.get(&replica.port).map(Option::as_ref)
+      })
+      .map(|replica| replica.port)
+  }
+
+  #[test]
+  fn should_read_from_replica_in_zone() {
+    let mut router = router(&[1, 2, 3]);
+    let connected = zones(&[(1, Some("a")), (2, Some("b")), (3, Some("c"))]);
+
+    for _ in 0 .. 5 {
+      assert_eq!(next_in_zone(&mut router, "b", &connected), Some(2));
+    }
+  }
+
+  #[test]
+  fn should_round_robin_across_replicas_in_zone() {
+    let mut router = router(&[1, 2, 3, 4]);
+    let connected = zones(&[(1, Some("a")), (2, Some("b")), (3, Some("a")), (4, Some("b"))]);
+
+    let ports: Vec<_> = (0 .. 4).map(|_| next_in_zone(&mut router, "a", &connected)).collect();
+    assert_eq!(ports, vec![Some(3), Some(1), Some(3), Some(1)]);
+  }
+
+  #[test]
+  fn should_fall_back_to_any_connected_replica_outside_zone() {
+    let mut router = router(&[1, 2]);
+    let connected = zones(&[(1, Some("b")), (2, None)]);
+
+    let mut ports: Vec<_> = (0 .. 4).map(|_| next_in_zone(&mut router, "a", &connected)).collect();
+    ports.sort();
+    assert_eq!(ports, vec![Some(1), Some(1), Some(2), Some(2)]);
+  }
+
+  #[test]
+  fn should_skip_disconnected_replica_in_zone() {
+    let mut router = router(&[1, 2]);
+    // the replica in zone "a" (port 1) lost its connection
+    let connected = zones(&[(2, Some("b"))]);
+
+    for _ in 0 .. 3 {
+      assert_eq!(next_in_zone(&mut router, "a", &connected), Some(2));
+    }
+  }
+
+  #[test]
+  fn should_round_robin_when_no_replica_is_connected() {
+    let mut router = router(&[1, 2]);
+    let connected = zones(&[]);
+
+    let ports: Vec<_> = (0 .. 4).map(|_| next_in_zone(&mut router, "a", &connected)).collect();
+    assert_eq!(ports, vec![Some(2), Some(1), Some(2), Some(1)]);
+  }
+
+  #[test]
+  fn should_connect_eagerly_when_zone_aware() {
+    let config = ReplicaConfig::default();
+    assert!(config.lazy());
+
+    let config = ReplicaConfig {
+      read_from: ReadFrom::AzAffinity("us-east4-a".into()),
+      ..ReplicaConfig::default()
+    };
+    assert!(!config.lazy());
+  }
+
+  #[test]
+  fn should_read_zone_from_read_from() {
+    assert_eq!(ReadFrom::default(), ReadFrom::AnyReplica);
+    assert_eq!(ReadFrom::AnyReplica.zone(), None);
+    assert_eq!(
+      ReadFrom::AzAffinityReplicasAndPrimary("us-east4-a".into()).zone(),
+      Some(&Str::from_static("us-east4-a"))
+    );
+  }
+}

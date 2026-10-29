@@ -506,6 +506,7 @@ async fn sync_cluster_replicas(inner: &RefCount<ClientInner>, router: &mut Route
 }
 
 /// Repeatedly try to sync the cluster state, reconnecting as needed until the max reconnection attempts is reached.
+/// Without a cluster, try once.
 #[cfg(feature = "replicas")]
 pub async fn sync_replicas_with_policy(
   inner: &RefCount<ClientInner>,
@@ -525,6 +526,11 @@ pub async fn sync_replicas_with_policy(
 
       if e.should_not_reconnect() {
         break;
+      } else if !inner.config.server.is_clustered() {
+        // Without a cluster this only re-reads the primary's replicas, so it is tried once. Retrying here holds the
+        // router, and every command behind it, until each replica `ROLE` lists can be reached. The replicas that
+        // could be reached are already routed, and the next sync tries the rest.
+        return Err(e);
       } else {
         // return the underlying error on the last attempt
         delay = match next_reconnection_delay(inner) {

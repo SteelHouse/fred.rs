@@ -36,6 +36,10 @@ use std::{
 #[cfg(feature = "transactions")]
 pub mod transactions;
 #[cfg(feature = "replicas")]
+use crate::types::config::ReadFrom;
+#[cfg(feature = "replicas")]
+use bytes_utils::Str;
+#[cfg(feature = "replicas")]
 use replicas::Replicas;
 
 #[derive(Debug, Clone, Eq, PartialEq)]
@@ -82,17 +86,57 @@ impl Router {
       pending_reconnection: HashSet::new(),
       connections,
       #[cfg(feature = "replicas")]
-      replicas: Replicas::new(),
+      replicas: Replicas::new(inner.connection.replica.read_from.clone()),
     }
   }
 
-  /// Find the primary node that owns the hash slot used by the command.
+  /// Find the primary node whose replicas can serve the command: the owner of its hash slot in a cluster.
+  ///
+  /// A centralized or sentinel client only reads from its primary's replicas with a zone-aware
+  /// [ReadFrom](crate::types::config::ReadFrom), which connects to them eagerly. Otherwise it keeps sending replica
+  /// commands to the primary.
   #[cfg(feature = "replicas")]
   pub fn cluster_owner(&self, command: &Command) -> Option<&Server> {
     match self.connections {
       Connections::Clustered { ref cache, .. } => command.cluster_hash().and_then(|slot| cache.get_server(slot)),
-      _ => None,
+      Connections::Centralized { ref connection } | Connections::Sentinel { ref connection } => {
+        if self.replicas.read_from.zone().is_some() {
+          connection.as_ref().map(|conn| &conn.server)
+        } else {
+          None
+        }
+      },
     }
+  }
+
+  /// The zone reported by the connection to `primary`.
+  #[cfg(feature = "replicas")]
+  fn primary_zone(&self, primary: &Server) -> Option<&Str> {
+    match self.connections {
+      Connections::Clustered { ref connections, .. } => connections.get(primary),
+      Connections::Centralized { ref connection } | Connections::Sentinel { ref connection } => connection.as_ref(),
+    }
+    .and_then(|conn| conn.zone.as_ref())
+  }
+
+  /// Whether a command sent to replicas should go to the primary instead, because no replica of the shard has a
+  /// connection in the client's zone and the primary is in that zone
+  /// ([ReadFrom::AzAffinityReplicasAndPrimary](crate::types::config::ReadFrom::AzAffinityReplicasAndPrimary)).
+  #[cfg(feature = "replicas")]
+  pub fn should_read_from_primary(&self, command: &Command) -> bool {
+    let zone = match self.replicas.read_from {
+      ReadFrom::AzAffinityReplicasAndPrimary(ref zone) => zone,
+      _ => return false,
+    };
+    if command.cluster_node.is_some() {
+      return false;
+    }
+    let primary = match self.cluster_owner(command) {
+      Some(primary) => primary,
+      None => return false,
+    };
+
+    !self.replicas.has_connection_in_zone(primary, zone) && self.primary_zone(primary) == Some(zone)
   }
 
   /// Whether a deferred reconnection command exists for the provided server.
@@ -138,10 +182,7 @@ impl Router {
       None => {
         if command.use_replica {
           match self.cluster_owner(command).cloned() {
-            Some(primary) => match self.replicas.routing.next_replica(&primary) {
-              Some(replica) => self.replicas.connections.get_mut(replica),
-              None => None,
-            },
+            Some(primary) => self.replicas.route(&primary),
             None => None,
           }
         } else {
@@ -329,19 +370,8 @@ impl Router {
     _debug!(inner, "Syncing replicas...");
     self.replicas.drop_broken_connections().await;
     let old_connections = self.replicas.active_connections().await;
-    let new_replica_map = self.connections.replica_map(inner).await?;
-
-    let old_connections_idx: HashSet<_> = old_connections.iter().collect();
-    let new_connections_idx: HashSet<_> = new_replica_map.keys().collect();
-    let remove: Vec<_> = old_connections_idx.difference(&new_connections_idx).collect();
-
-    for server in remove.into_iter() {
-      _debug!(inner, "Dropping replica connection to {}", server);
-      self.replicas.drop_writer(inner, server).await;
-      self.replicas.remove_replica(server);
-    }
-
-    for (mut replica, primary) in new_replica_map.into_iter() {
+    let mut new_replica_map = Vec::new();
+    for (replica, primary) in self.connections.replica_map(inner).await?.into_iter() {
       let should_use = if let Some(filter) = inner.connection.replica.filter.as_ref() {
         filter.filter(&primary, &replica).await
       } else {
@@ -349,17 +379,72 @@ impl Router {
       };
 
       if should_use {
-        replicas::map_replica_tls_names(inner, &primary, &mut replica);
-
-        self.replicas.add_connection(inner, primary, replica, false).await?;
+        new_replica_map.push((replica, primary));
       }
     }
 
+    let new_connections_idx: HashSet<_> = new_replica_map.iter().map(|(replica, _)| replica).collect();
+    for server in old_connections
+      .iter()
+      .filter(|server| !new_connections_idx.contains(server))
+    {
+      _debug!(inner, "Dropping replica connection to {}", server);
+      self.replicas.drop_writer(inner, server).await;
+      self.replicas.remove_replica(server);
+    }
+
+    // Keep going past a replica that cannot be reached: a sync after `refresh_replica_routing` starts from an empty
+    // routing table, so stopping early would leave every replica after it unrouted.
+    let mut result = Ok(());
+    for (mut replica, primary) in new_replica_map.into_iter() {
+      replicas::map_replica_tls_names(inner, &primary, &mut replica);
+
+      if let Err(err) = self
+        .replicas
+        .add_connection(inner, primary, replica.clone(), false)
+        .await
+      {
+        _warn!(inner, "Failed to connect to replica {}: {:?}", replica, err);
+        if result.is_ok() {
+          result = Err(err);
+        }
+      }
+    }
+
+    if let Some(zone) = inner.connection.replica.read_from.zone() {
+      self.check_zone(inner, zone);
+    }
     inner
       .server_state
       .write()
       .update_replicas(self.replicas.routing_table());
-    Ok(())
+    result
+  }
+
+  /// Warn when no node reports the zone the client prefers, since every read then leaves the zone.
+  #[cfg(feature = "replicas")]
+  fn check_zone(&self, inner: &RefCount<ClientInner>, zone: &Str) {
+    let replicas = self.replicas.connections.values();
+    let in_zone = match self.connections {
+      Connections::Clustered { ref connections, .. } => replicas
+        .chain(connections.values())
+        .filter(|conn| conn.zone.as_ref() == Some(zone))
+        .count(),
+      Connections::Centralized { ref connection } | Connections::Sentinel { ref connection } => replicas
+        .chain(connection.iter())
+        .filter(|conn| conn.zone.as_ref() == Some(zone))
+        .count(),
+    };
+
+    if in_zone == 0 {
+      _warn!(
+        inner,
+        "No connected node reports availability zone {}. Reads will not prefer any zone.",
+        zone
+      );
+    } else {
+      _debug!(inner, "Connected to {} nodes in availability zone {}", in_zone, zone);
+    }
   }
 
   /// Attempt to replay all queued commands on the internal buffer without backpressure.

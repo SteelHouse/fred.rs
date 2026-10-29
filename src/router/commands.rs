@@ -28,7 +28,7 @@ async fn create_replica_connection(
   router: &mut Router,
   mut command: Command,
 ) -> Result<(), Error> {
-  if command.use_replica && inner.connection.replica.lazy_connections {
+  if command.use_replica && inner.connection.replica.lazy() {
     let (primary, replica) = match utils::route_replica(router, &command) {
       Ok((primary, replica)) => (primary, replica),
       Err(err) => {
@@ -64,7 +64,7 @@ async fn create_replica_connection(
       command.attempts_remaining += 1;
       interfaces::send_to_router(inner, command.into())
     }
-  } else if command.use_replica && !inner.connection.replica.lazy_connections {
+  } else if command.use_replica && !inner.connection.replica.lazy() {
     // connection does not exist and the client is not configured to create more
     if inner.connection.replica.primary_fallback {
       command.attempts_remaining += 1;
@@ -111,6 +111,10 @@ pub async fn write_command(
   if let Err(err) = command.decr_check_attempted() {
     command.respond_to_caller(Err(err));
     return Ok(());
+  }
+  #[cfg(feature = "replicas")]
+  if command.use_replica && router.should_read_from_primary(&command) {
+    command.use_replica = false;
   }
   let closes_connection = command.kind.closes_connection();
   let is_blocking = command.blocks_connection();

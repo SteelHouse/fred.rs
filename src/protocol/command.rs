@@ -1892,6 +1892,16 @@ impl Command {
         self.timeout_dur = Some(default_dur);
       }
     }
+    // Only here, as the client sends the command: falling back to the primary clears `use_replica` and resends it,
+    // which must not set it again.
+    #[cfg(feature = "replicas")]
+    if inner.connection.replica.replicas_by_default
+      && !self.is_all_cluster_nodes()
+      && !self.kind.closes_connection()
+      && !self.blocks_connection()
+    {
+      self.use_replica = true;
+    }
   }
 
   /// Take the command tracing state for the `queued` span.
